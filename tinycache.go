@@ -78,11 +78,12 @@ func (c *Cache[T]) SetTTL(key string, value T, ttl time.Duration) {
 
 func (c *Cache[T]) Get(key string) (T, bool) {
 	if v, ok := c.store.Load(key); ok {
-		entry := v.(entry[T])
-		if entry.expires.After(time.Now()) {
-			return entry.value, true
+		if entry, ok := v.(entry[T]); ok {
+			if entry.expires.After(time.Now()) {
+				return entry.value, true
+			}
+			c.Delete(key)
 		}
-		c.Delete(key)
 	}
 	return *new(T), false
 }
