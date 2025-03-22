@@ -48,12 +48,13 @@ func New[T any](opts ...Option) *Cache[T] {
 
 	if options.reapInterval > 0 {
 		go func() {
+			ticker := time.NewTicker(options.reapInterval)
+			defer ticker.Stop()
 			for {
 				select {
 				case <-cache.closeCh:
 					return
-				default:
-					time.Sleep(options.reapInterval)
+				case <-ticker.C:
 					cache.Reap()
 				}
 			}
