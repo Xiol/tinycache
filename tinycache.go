@@ -89,10 +89,12 @@ func (c *Cache[T]) Get(key string) (T, bool) {
 }
 
 func (c *Cache[T]) Reap() {
-	c.store.Range(func(key, value interface{}) bool {
-		entry := value.(entry[T])
-		if entry.expires.Before(time.Now()) {
-			c.Delete(key.(string))
+	now := time.Now()
+	c.store.Range(func(key, value any) bool {
+		if entry, ok := value.(entry[T]); ok {
+			if entry.expires.Before(now) {
+				c.Delete(key.(string))
+			}
 		}
 		return true
 	})
