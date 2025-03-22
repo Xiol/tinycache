@@ -26,7 +26,8 @@ func main() {
 	cache := tinycache.New[string](
 		// WithTTL sets the default TTL for all keys. TTLs for
 		// individual keys can be set with SetTTL(), and this
-		// overrides the default. If omitted, keys will not expire.
+		// overrides the default. If omitted or zero, keys will 
+		// not expire.
 		tinycache.WithTTL(1*time.Second),
 
 		// When WithReapInterval is provided, a reaper goroutine

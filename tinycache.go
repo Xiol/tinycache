@@ -2,18 +2,26 @@ package tinycache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const (
+	// noExpiration represents a timestamp that will never expire (maximum int64 value)
+	noExpiration int64 = 1<<63 - 1
+)
+
 type entry[T any] struct {
-	value   T
-	expires time.Time
+	value       T
+	expiresUnix int64
 }
 
 type Cache[T any] struct {
-	store      sync.Map
+	mu         sync.RWMutex
+	store      map[string]*entry[T]
 	defaultTTL time.Duration
 	closeCh    chan struct{}
+	entryPool  sync.Pool
 }
 
 type cacheOptions struct {
@@ -43,6 +51,12 @@ func New[T any](opts ...Option) *Cache[T] {
 
 	cache := &Cache[T]{
 		defaultTTL: options.defaultTTL,
+		store:      make(map[string]*entry[T]),
+		entryPool: sync.Pool{
+			New: func() any {
+				return new(entry[T])
+			},
+		},
 	}
 
 	if options.reapInterval > 0 {
@@ -65,47 +79,131 @@ func New[T any](opts ...Option) *Cache[T] {
 }
 
 func (c *Cache[T]) Delete(key string) {
-	c.store.Delete(key)
+	c.mu.Lock()
+	if e, ok := c.store[key]; ok {
+		delete(c.store, key)
+		c.entryPool.Put(e)
+	}
+	c.mu.Unlock()
 }
 
 func (c *Cache[T]) Set(key string, value T) {
-	c.store.Store(key, entry[T]{value: value, expires: time.Now().Add(c.defaultTTL)})
+	var expiresUnix int64
+
+	if c.defaultTTL == 0 {
+		expiresUnix = noExpiration
+	} else {
+		expiresUnix = time.Now().Add(c.defaultTTL).Unix()
+	}
+
+	e := c.entryPool.Get().(*entry[T])
+	e.value = value
+	atomic.StoreInt64(&e.expiresUnix, expiresUnix)
+
+	c.mu.Lock()
+	if oldEntry, exists := c.store[key]; exists {
+		c.entryPool.Put(oldEntry)
+	}
+	c.store[key] = e
+	c.mu.Unlock()
 }
 
 func (c *Cache[T]) SetTTL(key string, value T, ttl time.Duration) {
-	c.store.Store(key, entry[T]{value: value, expires: time.Now().Add(ttl)})
+	var expiresUnix int64
+
+	if ttl == 0 {
+		expiresUnix = noExpiration
+	} else {
+		expiresUnix = time.Now().Add(ttl).Unix()
+	}
+
+	e := c.entryPool.Get().(*entry[T])
+	e.value = value
+	atomic.StoreInt64(&e.expiresUnix, expiresUnix)
+
+	c.mu.Lock()
+	if oldEntry, exists := c.store[key]; exists {
+		c.entryPool.Put(oldEntry)
+	}
+	c.store[key] = e
+	c.mu.Unlock()
+}
+
+func (c *Cache[T]) SetPermanent(key string, value T) {
+	e := c.entryPool.Get().(*entry[T])
+	e.value = value
+	atomic.StoreInt64(&e.expiresUnix, noExpiration)
+
+	c.mu.Lock()
+	if oldEntry, exists := c.store[key]; exists {
+		c.entryPool.Put(oldEntry)
+	}
+	c.store[key] = e
+	c.mu.Unlock()
 }
 
 func (c *Cache[T]) Get(key string) (T, bool) {
-	if v, ok := c.store.Load(key); ok {
-		if entry, ok := v.(entry[T]); ok {
-			if entry.expires.After(time.Now()) {
-				return entry.value, true
-			}
+	var value T
+	var found bool
+
+	c.mu.RLock()
+	if e, ok := c.store[key]; ok {
+		expiresUnix := atomic.LoadInt64(&e.expiresUnix)
+
+		now := time.Now().Unix()
+		if expiresUnix == noExpiration || expiresUnix > now {
+			value = e.value
+			found = true
+		} else {
+			// Need to switch to write lock to delete expired entry
+			c.mu.RUnlock()
 			c.Delete(key)
+			return value, false
 		}
 	}
+	c.mu.RUnlock()
 
-	var zero T
-	return zero, false
+	return value, found
 }
 
 func (c *Cache[T]) Reap() {
-	now := time.Now()
-	c.store.Range(func(key, value any) bool {
-		if entry, ok := value.(entry[T]); ok {
-			if entry.expires.Before(now) {
-				c.Delete(key.(string))
+	var keysToDelete []string
+
+	now := time.Now().Unix()
+
+	c.mu.RLock()
+	for key, e := range c.store {
+		expiresUnix := atomic.LoadInt64(&e.expiresUnix)
+		if expiresUnix != noExpiration && expiresUnix < now {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	c.mu.RUnlock()
+
+	if len(keysToDelete) > 0 {
+		c.mu.Lock()
+		for _, key := range keysToDelete {
+			if e, ok := c.store[key]; ok {
+				expiresUnix := atomic.LoadInt64(&e.expiresUnix)
+				if expiresUnix != noExpiration && expiresUnix < now {
+					delete(c.store, key)
+					c.entryPool.Put(e)
+				}
 			}
 		}
-		return true
-	})
+		c.mu.Unlock()
+	}
 }
 
 func (c *Cache[T]) Close() {
-	close(c.closeCh)
-	c.store.Range(func(key, _ any) bool {
-		c.store.Delete(key)
-		return true
-	})
+	if c.closeCh != nil {
+		close(c.closeCh)
+	}
+
+	c.mu.Lock()
+	for key, e := range c.store {
+		c.entryPool.Put(e)
+		delete(c.store, key)
+	}
+	c.mu.Unlock()
 }
