@@ -43,10 +43,10 @@ func New[T any](opts ...Option) *Cache[T] {
 
 	cache := &Cache[T]{
 		defaultTTL: options.defaultTTL,
-		closeCh:    make(chan struct{}),
 	}
 
 	if options.reapInterval > 0 {
+		cache.closeCh = make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(options.reapInterval)
 			defer ticker.Stop()
@@ -85,7 +85,9 @@ func (c *Cache[T]) Get(key string) (T, bool) {
 			c.Delete(key)
 		}
 	}
-	return *new(T), false
+
+	var zero T
+	return zero, false
 }
 
 func (c *Cache[T]) Reap() {
@@ -102,5 +104,8 @@ func (c *Cache[T]) Reap() {
 
 func (c *Cache[T]) Close() {
 	close(c.closeCh)
-	c.store = sync.Map{}
+	c.store.Range(func(key, _ any) bool {
+		c.store.Delete(key)
+		return true
+	})
 }
