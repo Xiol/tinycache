@@ -2,7 +2,6 @@ package tinycache
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -12,8 +11,8 @@ const (
 )
 
 type entry[T any] struct {
-	value       T
-	expiresUnix int64
+	value      T
+	expiresAt  int64
 }
 
 type Cache[T any] struct {
@@ -21,6 +20,7 @@ type Cache[T any] struct {
 	store      map[string]*entry[T]
 	defaultTTL time.Duration
 	closeCh    chan struct{}
+	stopReaper func()
 	entryPool  sync.Pool
 }
 
@@ -52,6 +52,7 @@ func New[T any](opts ...Option) *Cache[T] {
 	cache := &Cache[T]{
 		defaultTTL: options.defaultTTL,
 		store:      make(map[string]*entry[T]),
+		stopReaper: func() {},
 		entryPool: sync.Pool{
 			New: func() any {
 				return new(entry[T])
@@ -61,6 +62,7 @@ func New[T any](opts ...Option) *Cache[T] {
 
 	if options.reapInterval > 0 {
 		cache.closeCh = make(chan struct{})
+		cache.stopReaper = sync.OnceFunc(func() { close(cache.closeCh) })
 		go func() {
 			ticker := time.NewTicker(options.reapInterval)
 			defer ticker.Stop()
@@ -78,6 +80,13 @@ func New[T any](opts ...Option) *Cache[T] {
 	return cache
 }
 
+func expiryFor(ttl time.Duration) int64 {
+	if ttl == 0 {
+		return noExpiration
+	}
+	return time.Now().Add(ttl).UnixNano()
+}
+
 func (c *Cache[T]) Delete(key string) {
 	c.mu.Lock()
 	if e, ok := c.store[key]; ok {
@@ -87,118 +96,95 @@ func (c *Cache[T]) Delete(key string) {
 	c.mu.Unlock()
 }
 
-func (c *Cache[T]) Set(key string, value T) {
-	var expiresUnix int64
-
-	if c.defaultTTL == 0 {
-		expiresUnix = noExpiration
-	} else {
-		expiresUnix = time.Now().Add(c.defaultTTL).Unix()
-	}
-
+func (c *Cache[T]) set(key string, value T, expiresAt int64) {
 	e := c.entryPool.Get().(*entry[T])
 	e.value = value
-	atomic.StoreInt64(&e.expiresUnix, expiresUnix)
+	e.expiresAt = expiresAt
 
 	c.mu.Lock()
-	if oldEntry, exists := c.store[key]; exists {
-		c.entryPool.Put(oldEntry)
+	if old, exists := c.store[key]; exists {
+		c.entryPool.Put(old)
 	}
 	c.store[key] = e
 	c.mu.Unlock()
+}
+
+func (c *Cache[T]) Set(key string, value T) {
+	c.set(key, value, expiryFor(c.defaultTTL))
 }
 
 func (c *Cache[T]) SetTTL(key string, value T, ttl time.Duration) {
-	var expiresUnix int64
-
-	if ttl == 0 {
-		expiresUnix = noExpiration
-	} else {
-		expiresUnix = time.Now().Add(ttl).Unix()
-	}
-
-	e := c.entryPool.Get().(*entry[T])
-	e.value = value
-	atomic.StoreInt64(&e.expiresUnix, expiresUnix)
-
-	c.mu.Lock()
-	if oldEntry, exists := c.store[key]; exists {
-		c.entryPool.Put(oldEntry)
-	}
-	c.store[key] = e
-	c.mu.Unlock()
+	c.set(key, value, expiryFor(ttl))
 }
 
 func (c *Cache[T]) SetPermanent(key string, value T) {
-	e := c.entryPool.Get().(*entry[T])
-	e.value = value
-	atomic.StoreInt64(&e.expiresUnix, noExpiration)
-
-	c.mu.Lock()
-	if oldEntry, exists := c.store[key]; exists {
-		c.entryPool.Put(oldEntry)
-	}
-	c.store[key] = e
-	c.mu.Unlock()
+	c.set(key, value, noExpiration)
 }
 
 func (c *Cache[T]) Get(key string) (T, bool) {
-	var value T
-	var found bool
+	var zero T
 
 	c.mu.RLock()
-	if e, ok := c.store[key]; ok {
-		expiresUnix := atomic.LoadInt64(&e.expiresUnix)
+	e, ok := c.store[key]
+	if !ok {
+		c.mu.RUnlock()
+		return zero, false
+	}
 
-		now := time.Now().Unix()
-		if expiresUnix == noExpiration || expiresUnix > now {
-			value = e.value
-			found = true
-		} else {
-			// Need to switch to write lock to delete expired entry
-			c.mu.RUnlock()
-			c.Delete(key)
-			return value, false
-		}
+	now := time.Now().UnixNano()
+	if e.expiresAt == noExpiration || e.expiresAt > now {
+		value := e.value
+		c.mu.RUnlock()
+		return value, true
 	}
 	c.mu.RUnlock()
 
-	return value, found
+	// Expired: re-check expiry under the write lock before deleting, so a
+	// concurrent Set that happened between RUnlock and Lock isn't clobbered.
+	c.mu.Lock()
+	if cur, exists := c.store[key]; exists {
+		now = time.Now().UnixNano()
+		if cur.expiresAt != noExpiration && cur.expiresAt < now {
+			delete(c.store, key)
+			c.entryPool.Put(cur)
+		}
+	}
+	c.mu.Unlock()
+	return zero, false
 }
 
 func (c *Cache[T]) Reap() {
 	var keysToDelete []string
 
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 
 	c.mu.RLock()
 	for key, e := range c.store {
-		expiresUnix := atomic.LoadInt64(&e.expiresUnix)
-		if expiresUnix != noExpiration && expiresUnix < now {
+		if e.expiresAt != noExpiration && e.expiresAt < now {
 			keysToDelete = append(keysToDelete, key)
 		}
 	}
 	c.mu.RUnlock()
 
-	if len(keysToDelete) > 0 {
-		c.mu.Lock()
-		for _, key := range keysToDelete {
-			if e, ok := c.store[key]; ok {
-				expiresUnix := atomic.LoadInt64(&e.expiresUnix)
-				if expiresUnix != noExpiration && expiresUnix < now {
-					delete(c.store, key)
-					c.entryPool.Put(e)
-				}
+	if len(keysToDelete) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	now = time.Now().UnixNano()
+	for _, key := range keysToDelete {
+		if e, ok := c.store[key]; ok {
+			if e.expiresAt != noExpiration && e.expiresAt < now {
+				delete(c.store, key)
+				c.entryPool.Put(e)
 			}
 		}
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 }
 
 func (c *Cache[T]) Close() {
-	if c.closeCh != nil {
-		close(c.closeCh)
-	}
+	c.stopReaper()
 
 	c.mu.Lock()
 	for key, e := range c.store {

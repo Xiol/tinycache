@@ -181,32 +181,28 @@ func TestCacheConcurrentSetAndGet(t *testing.T) {
 	numOperations := 1000
 
 	// Concurrently set values
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+	for id := range numGoroutines {
+		wg.Go(func() {
+			for j := range numOperations {
 				cache.Set(fmt.Sprintf("key-%d-%d", id, j), id*j)
 			}
-		}(i)
+		})
 	}
 
 	// Concurrently get values
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+	for id := range numGoroutines {
+		wg.Go(func() {
+			for j := range numOperations {
 				cache.Get(fmt.Sprintf("key-%d-%d", id, j))
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
 
 	// Verify some values
-	for i := 0; i < numGoroutines; i++ {
-		for j := 0; j < numOperations; j++ {
+	for i := range numGoroutines {
+		for j := range numOperations {
 			value, ok := cache.Get(fmt.Sprintf("key-%d-%d", i, j))
 			if !ok {
 				t.Errorf("expected to get a value for key-%d-%d, but got none", i, j)
@@ -224,6 +220,60 @@ func TestCloseWithNilChannel(t *testing.T) {
 
 	// This should not panic
 	cache.Close()
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	cache := New[int](WithReapInterval(1 * time.Hour))
+
+	cache.Close()
+	cache.Close() // must not panic from closing an already-closed channel
+}
+
+func TestGetExpiredDoesNotClobberConcurrentSet(t *testing.T) {
+	// Regression: when Get found an expired entry it released the RLock and
+	// called Delete(key), which re-looked up the key under the write lock and
+	// would delete whichever entry was at that key — including a fresh one
+	// written by a racing Set.
+	const iterations = 5000
+	cache := New[int]()
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		for i := range iterations {
+			cache.SetTTL("k", i, -1*time.Nanosecond) // already expired
+			cache.SetPermanent("k", i)               // fresh, never expires
+		}
+	})
+
+	wg.Go(func() {
+		for range iterations {
+			cache.Get("k")
+		}
+	})
+
+	wg.Wait()
+
+	// After the writer's final SetPermanent, the key must still be present.
+	if _, ok := cache.Get("k"); !ok {
+		t.Errorf("expected key to be present; concurrent Get with expired entry clobbered a fresh Set")
+	}
+}
+
+func TestSubSecondTTL(t *testing.T) {
+	cache := New[int]()
+
+	cache.SetTTL("key", 42, 50*time.Millisecond)
+
+	if _, ok := cache.Get("key"); !ok {
+		t.Errorf("expected key to exist immediately after Set")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if _, ok := cache.Get("key"); ok {
+		t.Errorf("expected sub-second TTL to expire the key")
+	}
 }
 
 // ******* BENCHMARKS *******
@@ -256,9 +306,10 @@ func newBenchStruct(id int) benchStruct {
 func BenchmarkIntCache_Set(b *testing.B) {
 	cache := New[int](WithTTL(5 * time.Minute))
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		cache.Set(strconv.Itoa(i), i)
+		i++
 	}
 }
 
@@ -266,14 +317,15 @@ func BenchmarkIntCache_Get(b *testing.B) {
 	cache := New[int](WithTTL(5 * time.Minute))
 
 	// Pre-populate the cache
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		cache.Set(strconv.Itoa(i), i)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		// Get a mix of existing and non-existing keys
 		cache.Get(strconv.Itoa(i % 20000))
+		i++
 	}
 }
 
@@ -281,9 +333,10 @@ func BenchmarkIntCache_Get(b *testing.B) {
 func BenchmarkStructCache_Set(b *testing.B) {
 	cache := New[benchStruct](WithTTL(5 * time.Minute))
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		cache.Set(strconv.Itoa(i), newBenchStruct(i))
+		i++
 	}
 }
 
@@ -291,14 +344,15 @@ func BenchmarkStructCache_Get(b *testing.B) {
 	cache := New[benchStruct](WithTTL(5 * time.Minute))
 
 	// Pre-populate the cache
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		cache.Set(strconv.Itoa(i), newBenchStruct(i))
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		// Get a mix of existing and non-existing keys
 		cache.Get(strconv.Itoa(i % 20000))
+		i++
 	}
 }
 
@@ -307,31 +361,29 @@ func BenchmarkCache_GetWithExpiredTTL(b *testing.B) {
 	cache := New[int](WithTTL(1 * time.Nanosecond))
 
 	// Pre-populate the cache with already expired items
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		cache.Set(strconv.Itoa(i), i)
 	}
 
 	// Wait to ensure expiration
 	time.Sleep(1 * time.Millisecond)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		// Getting expired items forces expiration check
 		cache.Get(strconv.Itoa(i % 10000))
+		i++
 	}
 }
 
 // Benchmark the Reap function
 func BenchmarkCache_Reap(b *testing.B) {
-	// Create sets of 10,000 entries for each iteration
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		b.StopTimer()
 		cache := New[int](WithTTL(1 * time.Nanosecond))
 
 		// Add many items
-		for j := 0; j < 10000; j++ {
+		for j := range 10000 {
 			cache.Set(strconv.Itoa(j), j)
 		}
 
@@ -349,13 +401,14 @@ func BenchmarkCache_GetPermanent(b *testing.B) {
 	cache := New[int](WithTTL(5 * time.Minute))
 
 	// Pre-populate with permanent entries
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		cache.SetPermanent(strconv.Itoa(i), i)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		cache.Get(strconv.Itoa(i % 10000))
+		i++
 	}
 }
 
@@ -364,7 +417,7 @@ func BenchmarkCache_ConcurrentAccess(b *testing.B) {
 	cache := New[int](WithTTL(5 * time.Minute))
 
 	// Pre-populate
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		cache.Set(strconv.Itoa(i), i)
 	}
 
@@ -388,8 +441,8 @@ func BenchmarkCache_ConcurrentAccess(b *testing.B) {
 func BenchmarkCache_EntryReuse(b *testing.B) {
 	cache := New[int](WithTTL(1 * time.Millisecond))
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		// Set, wait for expiration, then set again to trigger pool reuse
 		key := "test-key"
 		cache.Set(key, i)
@@ -402,6 +455,7 @@ func BenchmarkCache_EntryReuse(b *testing.B) {
 
 		// Set the same key again, which should reuse the entry from the pool
 		cache.Set(key, i+1)
+		i++
 	}
 }
 
@@ -410,19 +464,23 @@ func BenchmarkCache_DifferentSizes(b *testing.B) {
 	// Test with small values
 	b.Run("SmallValue", func(b *testing.B) {
 		cache := New[int](WithTTL(5 * time.Minute))
-		for i := 0; i < b.N; i++ {
+		i := 0
+		for b.Loop() {
 			cache.Set(strconv.Itoa(i), i)
 			cache.Get(strconv.Itoa(i))
+			i++
 		}
 	})
 
 	// Test with medium strings
 	b.Run("MediumString", func(b *testing.B) {
 		cache := New[string](WithTTL(5 * time.Minute))
-		for i := 0; i < b.N; i++ {
+		i := 0
+		for b.Loop() {
 			value := fmt.Sprintf("medium-sized-string-value-%d-for-testing-performance", i)
 			cache.Set(strconv.Itoa(i), value)
 			cache.Get(strconv.Itoa(i))
+			i++
 		}
 	})
 
@@ -435,12 +493,13 @@ func BenchmarkCache_DifferentSizes(b *testing.B) {
 			Tags      []string
 			Timestamp time.Time
 			Active    bool
-			Metadata  map[string]interface{}
+			Metadata  map[string]any
 		}
 
 		cache := New[largeStruct](WithTTL(5 * time.Minute))
 
-		for i := 0; i < b.N; i++ {
+		i := 0
+		for b.Loop() {
 			// Create a large struct with arrays and maps
 			value := largeStruct{
 				ID:        i,
@@ -448,7 +507,7 @@ func BenchmarkCache_DifferentSizes(b *testing.B) {
 				Timestamp: time.Now(),
 				Active:    true,
 				Tags:      []string{"benchmark", "performance", "testing", "large"},
-				Metadata: map[string]interface{}{
+				Metadata: map[string]any{
 					"description": "A large struct for benchmarking",
 					"version":     1.0,
 					"created":     time.Now().String(),
@@ -460,12 +519,13 @@ func BenchmarkCache_DifferentSizes(b *testing.B) {
 			}
 
 			// Fill the array with values
-			for j := 0; j < 100; j++ {
+			for j := range 100 {
 				value.Values[j] = float64(i) * float64(j)
 			}
 
 			cache.Set(strconv.Itoa(i), value)
 			cache.Get(strconv.Itoa(i))
+			i++
 		}
 	})
 }
@@ -483,12 +543,12 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 		// Test sync.Map
 		b.Run("SyncMap", func(b *testing.B) {
 			var sm sync.Map
-			for i := 0; i < 1000; i++ {
+			for i := range 1000 {
 				sm.Store(strconv.Itoa(i), i)
 			}
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				if rand.Float32() < 0.9 {
 					// 90% reads
 					sm.Load(strconv.Itoa(rand.Intn(2000)))
@@ -496,6 +556,7 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 					// 10% writes
 					sm.Store(strconv.Itoa(rand.Intn(2000)), i)
 				}
+				i++
 			}
 		})
 
@@ -504,12 +565,12 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 			mc := mutexCache{
 				store: make(map[string]int, 1000),
 			}
-			for i := 0; i < 1000; i++ {
+			for i := range 1000 {
 				mc.store[strconv.Itoa(i)] = i
 			}
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				if rand.Float32() < 0.9 {
 					// 90% reads
 					mc.mu.RLock()
@@ -521,6 +582,7 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 					mc.store[strconv.Itoa(rand.Intn(2000))] = i
 					mc.mu.Unlock()
 				}
+				i++
 			}
 		})
 	})
@@ -530,12 +592,12 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 		// Test sync.Map
 		b.Run("SyncMap", func(b *testing.B) {
 			var sm sync.Map
-			for i := 0; i < 1000; i++ {
+			for i := range 1000 {
 				sm.Store(strconv.Itoa(i), i)
 			}
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				if rand.Float32() < 0.5 {
 					// 50% reads
 					sm.Load(strconv.Itoa(rand.Intn(2000)))
@@ -543,6 +605,7 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 					// 50% writes
 					sm.Store(strconv.Itoa(rand.Intn(2000)), i)
 				}
+				i++
 			}
 		})
 
@@ -551,12 +614,12 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 			mc := mutexCache{
 				store: make(map[string]int, 1000),
 			}
-			for i := 0; i < 1000; i++ {
+			for i := range 1000 {
 				mc.store[strconv.Itoa(i)] = i
 			}
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				if rand.Float32() < 0.5 {
 					// 50% reads
 					mc.mu.RLock()
@@ -568,6 +631,7 @@ func BenchmarkSyncMapVsMapMutex(b *testing.B) {
 					mc.store[strconv.Itoa(rand.Intn(2000))] = i
 					mc.mu.Unlock()
 				}
+				i++
 			}
 		})
 	})
