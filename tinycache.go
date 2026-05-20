@@ -168,13 +168,23 @@ func (c *Cache[T]) Reap() {
 	c.mu.Unlock()
 }
 
+func (c *Cache[T]) Len() int {
+	c.mu.RLock()
+	n := len(c.store)
+	c.mu.RUnlock()
+	return n
+}
+
+func (c *Cache[T]) Clear() {
+	c.mu.Lock()
+	for _, e := range c.store {
+		c.entryPool.Put(e)
+	}
+	clear(c.store)
+	c.mu.Unlock()
+}
+
 func (c *Cache[T]) Close() {
 	c.stopReaper()
-
-	c.mu.Lock()
-	for key, e := range c.store {
-		c.entryPool.Put(e)
-		delete(c.store, key)
-	}
-	c.mu.Unlock()
+	c.Clear()
 }

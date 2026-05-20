@@ -260,6 +260,37 @@ func TestGetExpiredDoesNotClobberConcurrentSet(t *testing.T) {
 	}
 }
 
+func TestLenAndClear(t *testing.T) {
+	cache := New[int]()
+
+	if got := cache.Len(); got != 0 {
+		t.Errorf("expected empty cache to have Len 0, got %d", got)
+	}
+
+	cache.Set("a", 1)
+	cache.Set("b", 2)
+	cache.SetPermanent("c", 3)
+
+	if got := cache.Len(); got != 3 {
+		t.Errorf("expected Len 3 after three Sets, got %d", got)
+	}
+
+	cache.Clear()
+
+	if got := cache.Len(); got != 0 {
+		t.Errorf("expected Len 0 after Clear, got %d", got)
+	}
+	if _, ok := cache.Get("a"); ok {
+		t.Errorf("expected key 'a' to be gone after Clear")
+	}
+
+	// Cache must remain usable after Clear.
+	cache.Set("d", 4)
+	if v, ok := cache.Get("d"); !ok || v != 4 {
+		t.Errorf("expected to Set/Get after Clear, got (%d, %v)", v, ok)
+	}
+}
+
 func TestSubSecondTTL(t *testing.T) {
 	cache := New[int]()
 
