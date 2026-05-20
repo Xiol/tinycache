@@ -1,3 +1,3 @@
 module github.com/Xiol/tinycache
 
-go 1.23
+go 1.25
