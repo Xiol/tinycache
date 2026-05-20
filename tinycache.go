@@ -1,6 +1,7 @@
 package tinycache
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -154,32 +155,16 @@ func (c *Cache[T]) Get(key string) (T, bool) {
 }
 
 func (c *Cache[T]) Reap() {
-	var keysToDelete []string
-
 	now := time.Now().UnixNano()
 
-	c.mu.RLock()
-	for key, e := range c.store {
-		if e.expiresAt != noExpiration && e.expiresAt < now {
-			keysToDelete = append(keysToDelete, key)
-		}
-	}
-	c.mu.RUnlock()
-
-	if len(keysToDelete) == 0 {
-		return
-	}
-
 	c.mu.Lock()
-	now = time.Now().UnixNano()
-	for _, key := range keysToDelete {
-		if e, ok := c.store[key]; ok {
-			if e.expiresAt != noExpiration && e.expiresAt < now {
-				delete(c.store, key)
-				c.entryPool.Put(e)
-			}
+	maps.DeleteFunc(c.store, func(_ string, e *entry[T]) bool {
+		if e.expiresAt != noExpiration && e.expiresAt < now {
+			c.entryPool.Put(e)
+			return true
 		}
-	}
+		return false
+	})
 	c.mu.Unlock()
 }
 
